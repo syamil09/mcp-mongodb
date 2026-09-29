@@ -1,0 +1,32 @@
+{
+  "connections": {
+    "DEV": {
+      "host": "127.0.0.1",
+      "port": 27017,
+      "username": "readonly_user",
+      "password": "CHANGE_ME",
+      "database": "my_database",
+      "auth_source": "admin",
+      "direct_connection": true,
+      "replica_set": "",
+      "tls": false,
+      "export_path": "exports/dev",
+      "max_documents": 500,
+      "max_response_chars": 50000,
+      "doc_preview_chars": 2000,
+      "timeout_seconds": 30
+    },
+    "PROD": {
+      "host": "db1.example.com:27017,db2.example.com:27017",
+      "username": "readonly_user",
+      "password": "CHANGE_ME",
+      "database": "my_database",
+      "auth_source": "admin",
+      "replica_set": "rs0",
+      "tls": true,
+      "export_path": "exports/prod",
+      "max_response_chars": 20000,
+      "doc_preview_chars": 500
+    }
+  }
+}
