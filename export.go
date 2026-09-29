@@ -138,6 +138,7 @@ func handleExportJSON(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	if err != nil {
 		return toolError(err.Error())
 	}
+	parentCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, conn.Config.Timeout())
 	defer cancel()
 	db := databaseName(conn, args)
@@ -152,7 +153,10 @@ func handleExportJSON(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 				results = append(results, entry)
 				continue
 			}
-			docs, err := fetchForExport(ctx, conn, db, item.Collection, item.ID, nil)
+			// Each item gets its own deadline so one slow item cannot starve the rest.
+			itemCtx, itemCancel := context.WithTimeout(parentCtx, conn.Config.Timeout())
+			docs, err := fetchForExport(itemCtx, conn, db, item.Collection, item.ID, nil)
+			itemCancel()
 			if err == nil {
 				outFile := filepath.Join(conn.Config.ExportPath, exportFileName(db, item.Collection, item.ID, time.Now()))
 				if err = writeExport(outFile, db, item.Collection, docs); err == nil {

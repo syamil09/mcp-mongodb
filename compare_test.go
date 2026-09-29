@@ -1,6 +1,10 @@
 package main
 
 import (
+	"reflect"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"os"
 	"path/filepath"
 	"strings"
@@ -197,5 +201,48 @@ func TestHandleCompare_Errors(t *testing.T) {
 				t.Errorf("want error %q, got (isErr=%v) %q", c.wantErr, isErr, text)
 			}
 		})
+	}
+}
+
+// Review I-2: NumberLong values above 2^53 must not collide after normalization.
+func TestCompareCollections_LargeIntIDsDoNotCollide(t *testing.T) {
+	a := docToMap(map[string]interface{}{"_id": int64(1234567890123456789), "v": int64(9007199254740993)})
+	b := docToMap(map[string]interface{}{"_id": int64(1234567890123456790), "v": int64(9007199254740993)})
+	docs, err := normalizeDocs([]map[string]interface{}{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := compareCollections(docs, docs[:1])
+	if r["total_documents"] != 2 || r["missing_in_b"] != 1 {
+		t.Errorf("large ids collided: %v", r)
+	}
+	_, fileDocs, _, _ := parseJSONData([]byte(`[{"_id": 1234567890123456789, "v": 9007199254740992}]`))
+	if compareDocs(docs[0], fileDocs[0])["match"] != false {
+		t.Error("values differing above 2^53 must mismatch")
+	}
+}
+
+// Review M-1 (re-graded Important): type drift between sources is a difference.
+func TestCompareDocs_TypeDriftIsMismatch(t *testing.T) {
+	a := mustJSONDoc(t, `{"n": 1, "b": true, "x": null}`)
+	b := mustJSONDoc(t, `{"n": "1", "b": "true", "x": "<nil>"}`)
+	if r := compareDocs(a, b); r["mismatched"] != 3 {
+		t.Errorf("want 3 type mismatches, got %v", r)
+	}
+}
+
+// Review I-1: collection reads must be deterministic (sorted by _id) and detect truncation.
+func TestCollectionFindOptions(t *testing.T) {
+	o := &options.FindOptions{}
+	for _, f := range collectionFindOptions(500).Opts {
+		if err := f(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if o.Limit == nil || *o.Limit != 501 {
+		t.Errorf("limit should be max+1 to detect truncation, got %v", o.Limit)
+	}
+	if !reflect.DeepEqual(o.Sort, bson.D{{Key: "_id", Value: 1}}) {
+		t.Errorf("sort = %v, want _id ascending", o.Sort)
 	}
 }

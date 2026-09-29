@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -153,7 +155,8 @@ func compareValues(prefix string, a, b interface{}, diffs *[]FieldDiff) (int, in
 	}
 
 	// Leaf comparison (scalars or type mismatch)
-	if fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b) {
+	// Types must agree too: "1" vs 1 or "true" vs true is drift, not a match.
+	if reflect.TypeOf(a) == reflect.TypeOf(b) && fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b) {
 		return 1, 1
 	}
 	*diffs = append(*diffs, FieldDiff{Path: prefix, Type: ValueMismatch, ValueA: a, ValueB: b})
@@ -255,7 +258,7 @@ func normalizeDocs(docs []map[string]interface{}) ([]map[string]interface{}, err
 		return nil, err
 	}
 	var out []map[string]interface{}
-	if err := json.Unmarshal(b, &out); err != nil {
+	if err := decodeJSONNumbers(b, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -267,61 +270,64 @@ func resolveSource(ctx context.Context, conn *Connection, db, source, sourceType
 	singleDoc map[string]interface{},
 	docs []map[string]interface{},
 	isCollection bool,
+	truncated bool,
 	err error,
 ) {
 	switch sourceType {
 	case "mongo":
 		collection, id, err := parseMongoSource(source)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, false, false, err
 		}
 		coll := conn.Client.Database(db).Collection(collection)
 		if id == "" {
 			max := conn.Config.MaxDocuments
-			cur, err := coll.Find(ctx, bson.D{}, options.Find().SetLimit(int64(max)))
+			cur, err := coll.Find(ctx, bson.D{}, collectionFindOptions(max))
 			if err != nil {
-				return nil, nil, false, fmt.Errorf("error reading collection %q: %w", collection, err)
+				return nil, nil, false, false, fmt.Errorf("error reading collection %q: %w", collection, err)
 			}
-			raw, _, err := readDocs(ctx, cur, max)
+			raw, truncated, err := readDocs(ctx, cur, max)
 			if err != nil {
-				return nil, nil, false, fmt.Errorf("error reading collection %q: %w", collection, err)
+				return nil, nil, false, false, fmt.Errorf("error reading collection %q: %w", collection, err)
 			}
 			docs, err = normalizeDocs(raw)
 			if err != nil {
-				return nil, nil, false, err
+				return nil, nil, false, false, err
 			}
-			return nil, docs, true, nil
+			return nil, docs, true, truncated, nil
 		}
 		idVal, err := parseID(id, "auto")
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, false, false, err
 		}
 		var raw bson.M
 		err = coll.FindOne(ctx, bson.D{{Key: "_id", Value: idVal}}).Decode(&raw)
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			return nil, nil, false, fmt.Errorf("document not found: _id %q in %s.%s", id, db, collection)
+			return nil, nil, false, false, fmt.Errorf("document not found: _id %q in %s.%s", id, db, collection)
 		}
 		if err != nil {
-			return nil, nil, false, fmt.Errorf("error fetching document: %w", err)
+			return nil, nil, false, false, fmt.Errorf("error fetching document: %w", err)
 		}
 		normalized, err := normalizeDocs([]map[string]interface{}{docToMap(raw)})
 		if err != nil {
-			return nil, nil, false, err
+			return nil, nil, false, false, err
 		}
-		return normalized[0], nil, false, nil
+		return normalized[0], nil, false, false, nil
 
 	case "file":
 		data, readErr := os.ReadFile(source)
 		if readErr != nil {
-			return nil, nil, false, fmt.Errorf("failed to read file %q: %w", source, readErr)
+			return nil, nil, false, false, fmt.Errorf("failed to read file %q: %w", source, readErr)
 		}
-		return parseJSONData(data)
+		single, docs, isColl, err := parseJSONData(data)
+		return single, docs, isColl, false, err
 
 	case "json":
-		return parseJSONData([]byte(source))
+		single, docs, isColl, err := parseJSONData([]byte(source))
+		return single, docs, isColl, false, err
 
 	default:
-		return nil, nil, false, fmt.Errorf("unknown source_type %q: must be 'mongo', 'file', or 'json'", sourceType)
+		return nil, nil, false, false, fmt.Errorf("unknown source_type %q: must be 'mongo', 'file', or 'json'", sourceType)
 	}
 }
 
@@ -330,7 +336,7 @@ func resolveSource(ctx context.Context, conn *Connection, db, source, sourceType
 // "collection") and mcp-firestore's ("count" + "documents" + "path").
 func parseJSONData(data []byte) (map[string]interface{}, []map[string]interface{}, bool, error) {
 	var obj map[string]interface{}
-	if err := json.Unmarshal(data, &obj); err == nil {
+	if err := decodeJSONNumbers(data, &obj); err == nil {
 		_, hasCount := obj["count"]
 		_, hasCollection := obj["collection"]
 		_, hasPath := obj["path"]
@@ -344,7 +350,7 @@ func parseJSONData(data []byte) (map[string]interface{}, []map[string]interface{
 	}
 
 	var arr []interface{}
-	if err := json.Unmarshal(data, &arr); err == nil {
+	if err := decodeJSONNumbers(data, &arr); err == nil {
 		return nil, objectsOnly(arr), true, nil
 	}
 
@@ -452,11 +458,11 @@ func handleCompare(ctx context.Context, req mcp.CallToolRequest) (_ *mcp.CallToo
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	singleA, docsA, isCollA, errA := resolveSource(ctx, connA, compareDatabase(connA, dbOverrideA), sourceA, sourceAType)
+	singleA, docsA, isCollA, truncA, errA := resolveSource(ctx, connA, compareDatabase(connA, dbOverrideA), sourceA, sourceAType)
 	if errA != nil {
 		return toolError(fmt.Sprintf("source_a error: %v", errA))
 	}
-	singleB, docsB, isCollB, errB := resolveSource(ctx, connB, compareDatabase(connB, dbOverrideB), sourceB, sourceBType)
+	singleB, docsB, isCollB, truncB, errB := resolveSource(ctx, connB, compareDatabase(connB, dbOverrideB), sourceB, sourceBType)
 	if errB != nil {
 		return toolError(fmt.Sprintf("source_b error: %v", errB))
 	}
@@ -527,6 +533,11 @@ func handleCompare(ctx context.Context, req mcp.CallToolRequest) (_ *mcp.CallToo
 		summary["missing_in_a"] = result["missing_in_a"]
 		summary["missing_in_b"] = result["missing_in_b"]
 	}
+	if truncA || truncB {
+		summary["truncated_a"] = truncA
+		summary["truncated_b"] = truncB
+		summary["truncation_note"] = "A mongo collection source exceeded max_documents; only the first max_documents by _id were compared."
+	}
 	if saveErr == nil && filePath != "" {
 		summary["full_data_path"] = filePath
 	} else if saveErr != nil {
@@ -561,4 +572,24 @@ func handleCompare(ctx context.Context, req mcp.CallToolRequest) (_ *mcp.CallToo
 	}
 
 	return mcp.NewToolResultText(string(sb)), nil
+}
+
+// collectionFindOptions reads a whole collection deterministically (sorted by
+// _id) and fetches one extra document so truncation can be detected.
+func collectionFindOptions(max int) *options.FindOptionsBuilder {
+	return options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}).SetLimit(int64(max) + 1)
+}
+
+// decodeJSONNumbers unmarshals with UseNumber so integers above 2^53 keep
+// full precision (plain float64 would merge distinct NumberLong values).
+func decodeJSONNumbers(data []byte, v interface{}) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if dec.More() {
+		return fmt.Errorf("unexpected data after JSON value")
+	}
+	return nil
 }
