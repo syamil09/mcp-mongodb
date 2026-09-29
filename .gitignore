@@ -1,0 +1,3 @@
+.mcp-mongodb-config.json
+*.exe
+exports/
