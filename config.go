@@ -156,3 +156,23 @@ func applyDefaults(cfg ConnectionConfig, configDir string) ConnectionConfig {
 	}
 	return cfg
 }
+
+var connManager *ConnectionManager
+
+// LoadConfig finds and parses the config file and initializes connManager.
+func LoadConfig() error {
+	data, path, err := readConfigFile(configSearchPaths())
+	if err != nil {
+		return err
+	}
+	configs, err := parseConfig(data, filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	cm := &ConnectionManager{}
+	if err := cm.Init(configs); err != nil {
+		return fmt.Errorf("failed to initialize connections: %w", err)
+	}
+	connManager = cm
+	return nil
+}
